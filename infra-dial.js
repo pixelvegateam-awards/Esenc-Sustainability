@@ -1,8 +1,8 @@
 /*!
- * infra-dial — pinned "infrastructure" stepper for Webflow (GSAP + ScrollTrigger + Observer)
- * Logic is intentionally unchanged from the battle-tested original; comments document real
- * edge-case fixes. Safe optimizations only: per-row DOM lookups are cached once, and the
- * load/fonts resync is factored into a single helper. Serve the minified build over the CDN.
+ * infra-dial: pinned "infrastructure" stepper for Webflow (GSAP + ScrollTrigger + Observer)
+ * Desktop branch is unchanged from the battle-tested original. The mobile branch was rewritten:
+ * the old per-row ranges depended on row height and collapsed on short phone rows.
+ * Serve the minified build over the CDN.
  */
 (function () {
   'use strict';
@@ -12,28 +12,43 @@
   var TICKS = [0, 0.2165, 0.4069, 0.6335, 0.8049];
 
   // How far the ring is filled on each item: one segment per item, closing
-  // the circle on the last one.  → [0.2165, 0.4069, 0.6335, 0.8049, 1]
+  // the circle on the last one. Result: [0.2165, 0.4069, 0.6335, 0.8049, 1]
   var FILL = TICKS.slice(1).concat(1);
 
   // Which marker (in DOM order) each item's fill lands on. Item 5 lands back
   // on the top marker, because that is where a full ring finishes.
   var TICK_DOM = [1, 2, 3, 4, 0];
 
+  /* ==================================================================
+     CONFIG BLOCK
+     Every adjustable value lives here. Nothing below this block needs
+     editing to change timing, pacing, breakpoints or feel.
+     ================================================================== */
   var CONFIG = {
-    stepDuration : 0.5,  // ring travel for one step, seconds — both directions
+    stepDuration : 0.5,   // ring travel for one step, in seconds, both directions
     stepEase     : 'power2.inOut',
 
-    // ---- Pacing. These three numbers are the whole feel of the section ----
-    cadence      : 0.9,   // s — shortest possible gap between two items
-    sustained    : 1.8,   // × cadence — pace while input never stops arriving
-    gestureGap   : 0.16,  // s of quiet that marks the start of a new gesture
+    // ---- Pacing. These four numbers are the whole feel of the section ----
+    cadence      : 0.55,  // s, shortest possible gap between two items
+    sustained    : 1.15,  // multiplier on cadence while input never stops arriving
+    gestureGap   : 0.09,  // s of quiet that marks the start of a new gesture
+    entryLock    : 0.3,   // s of immunity right after the section takes the input
 
-    tolerance    : 12,    // px of input before Observer reports a gesture
+    tolerance    : 10,    // px of input before Observer reports a gesture
     captionFade  : 380,   // keep in sync with the CSS fade on .infra_dial-text
     pinScreens   : 1.2,   // page scroll the pinned section owns
-    desktopFrom  : 768,   // below this: no pin, no input capture
-    debug        : false  // true → console.log every ring move
+
+    desktopFrom  : 768,   // below this width: no pin, no input capture
+
+    // ---- Mobile branch only ----
+    // Where the "active" line sits on screen, as a fraction of viewport height.
+    // 0 = very top, 1 = very bottom. The row whose centre is nearest this line
+    // becomes the current item. Lower the number to activate rows earlier.
+    mobileActiveLine : 0.55,
+
+    debug        : false  // true: log every ring move and every mobile sync
   };
+  /* ================= END CONFIG BLOCK ================= */
 
   function init(tries) {
     // Webflow's GSAP bundle normally loads above this file, but never assume.
@@ -59,10 +74,8 @@
 
     if (!arc || !rows.length || !track || !sticky) return;
 
-    // Cache per-row nodes and caption text once. The originals re-queried these
-    // on every step; the markup never changes after render, so this is pure
-    // win with identical behaviour. `rows` stays the element list for length,
-    // mobile triggers, etc.
+    // Cache per-row nodes and caption text once. The markup never changes
+    // after render, so this is identical behaviour with fewer DOM lookups.
     var items = rows.map(function (row) {
       var source = row.querySelector('.infra_dial-source');
       return {
@@ -76,12 +89,17 @@
     gsap.registerPlugin(ScrollTrigger);
     if (window.Observer) gsap.registerPlugin(Observer);
 
+    // Mobile browsers fire resize when the address bar hides or shows. Without
+    // this, ScrollTrigger refreshes mid-scroll and positions shift under the
+    // reader. Harmless on desktop.
+    ScrollTrigger.config({ ignoreMobileResize: true });
+
     /* --- Sole owner of this section -------------------------------------
        Two implementations writing to the same dial is unfixable from inside
        either one: an old scrub version caps the ring at 0.8049 (one segment
        short) and keeps overwriting the arc from its own 7-screen pin. So
        this script claims the section and retires anything else pinned to
-       it. Delete the old blocks from the custom code anyway — this is a
+       it. Delete the old blocks from the custom code anyway. This is a
        safety net, not a substitute.                                      */
     if (window.__infraStepper) return;      // a second copy of this script
     window.__infraStepper = true;
@@ -107,7 +125,7 @@
     sweepForeign();
 
     /* --- Lenis bridge ----------------------------------------------------
-       Lenis itself is booted from Site Settings → Footer. Read it lazily,
+       Lenis itself is booted from Site Settings, Footer. Read it lazily,
        every time: it may still be loading when this runs, and the section
        must work either way. With Lenis present the page is locked outright
        while the section holds the input, instead of relying on a
@@ -122,7 +140,7 @@
     }
 
     var steps      = rows.length;
-    var index      = -1;         // the committed item — the only source of truth
+    var index      = -1;         // the committed item, the only source of truth
     var animating  = false;
     var retreating = false;      // the ring is retracting back to empty
     var ring       = { value: 0 };
@@ -140,7 +158,7 @@
       markers.forEach(function (marker) {
         marker.classList.remove('is-on', 'is-now');
       });
-      for (var t = 0; t <= i; t++) {           // i === -1 → nothing lit
+      for (var t = 0; t <= i; t++) {           // i === -1 means nothing lit
         var marker = markers[TICK_DOM[t]];
         if (!marker) continue;
         marker.classList.add('is-on');
@@ -206,15 +224,15 @@
        ticks and caption commit together, and `animating` stays true for the
        whole travel so nothing can interrupt a step half-way through.
 
-       opts.instantPaint — swap rows/caption with no fade
-       opts.instantRing  — jump the ring instead of travelling
-       opts.force        — re-commit even if the index is unchanged          */
+       opts.instantPaint: swap rows and caption with no fade
+       opts.instantRing : jump the ring instead of travelling
+       opts.force       : re-commit even if the index is unchanged          */
     function commit(i, opts) {
       opts = opts || {};
       i = Math.max(0, Math.min(steps - 1, i));
       if (i === index && !opts.force) return false;
 
-      if (CONFIG.debug) console.log('[infra] item', index + 1, '→', i + 1, 'fill', FILL[i]);
+      if (CONFIG.debug) console.log('[infra] item', index + 1, 'to', i + 1, 'fill', FILL[i]);
 
       index = i;
       paintRows(i, !!opts.instantPaint);
@@ -241,7 +259,7 @@
     }
 
     // First paint only: item 1 open, ring empty, no tick lit. Segment 1 is
-    // NOT drawn here — the entry draws it, once.
+    // NOT drawn here. The entry draws it, once.
     function prepare() {
       if (ringTween) ringTween.kill();
       index = 0;
@@ -270,7 +288,7 @@
         var lastInput  = 0;
         var lastStep   = -1e9;
         var newGesture = true;   // flipped back on by a quiet gap in the input
-        var reEngageAt = 0;      // don't re-grab scrolling right after a release
+        var reEngageAt = 0;      // do not re-grab scrolling right after a release
 
         function onRefreshInit() { refreshing = true; }
         function onRefresh() { refreshing = false; }
@@ -281,7 +299,7 @@
            from _refreshAll(), i.e. before `pin` has been assigned. Reading
            pin.progress there threw "Cannot read properties of undefined
            (reading 'progress')" on load, which aborted the entry before it
-           could commit an item or capture input — leaving the dial to
+           could commit an item or capture input, leaving the dial to
            whatever else was painting it. So every callback uses the instance
            GSAP hands it and never relies on the variable.                 */
         var pin;
@@ -289,10 +307,10 @@
 
         // Built BEFORE the ScrollTrigger for the same reason: a callback can
         // fire from inside create(), and engage() must find a real observer
-        // to enable — otherwise the section pins with the input uncaptured.
-        // wheelSpeed:-1 matches GSAP's own stepper demos — onUp means the
-        // user is going *down* the page. preventDefault is kept as a second
-        // line of defence; with Lenis running, lockPage() is the one that
+        // to enable, otherwise the section pins with the input uncaptured.
+        // wheelSpeed:-1 matches GSAP's own stepper demos: onUp means the
+        // user is going down the page. preventDefault is kept as a second
+        // line of defence. With Lenis running, lockPage() is the one that
         // actually holds the page still.
         var observer = window.Observer && Observer.create({
           target         : window,
@@ -348,7 +366,7 @@
         window.addEventListener('keydown', onKey);
 
         // side: -1 arriving from above, +1 arriving from below. Only a real
-        // crossing may change the phase — during a refresh the callbacks are
+        // crossing may change the phase. During a refresh the callbacks are
         // just replays of where we already are. `engaged` is what separates a
         // replay from a real crossing: if we still hold the input we are
         // mid-pass, so the phase is left alone.
@@ -376,9 +394,9 @@
           }
 
           engaged = true;
-          lockPage();                  // hard stop — Lenis stops feeding scroll
+          lockPage();                  // hard stop, Lenis stops feeding scroll
 
-          // The phase decides what a re-entry restores — never the scroll
+          // The phase decides what a re-entry restores. Never the scroll
           // direction, and never a replay of the entry animation.
           if (phase === FRESH) {
             commit(0, { instantPaint: true, force: true });         // draw segment 1
@@ -387,9 +405,13 @@
           }
           phase = INSIDE;
 
-          // Treat the arrival as a step for pacing, so the momentum tail that
-          // carried the reader in cannot immediately advance an item.
-          lastInput = lastStep = performance.now();
+          // The momentum tail that carried the reader in must not immediately
+          // advance an item. Backdating lastStep gives a short entryLock
+          // instead of a full cadence, so the first deliberate scroll after
+          // arriving is answered quickly rather than sitting dead for a second.
+          var t0 = performance.now();
+          lastInput = t0;
+          lastStep = t0 - Math.max(0, (CONFIG.cadence - CONFIG.entryLock) * 1000);
           newGesture = false;
 
           if (observer) observer.enable();
@@ -406,10 +428,10 @@
           disengage();
           if (refreshing) return;   // a refresh is not a real exit
           if (dir < 0) {
-            retreat();              // out of the top → retract the ring to empty
+            retreat();              // out of the top: retract the ring to empty
             phase = FRESH;
           } else {
-            phase = DONE;           // out of the bottom → keep item 5, ring closed
+            phase = DONE;           // out of the bottom: keep item 5, ring closed
           }
         }
 
@@ -435,8 +457,8 @@
 
           var since = now - lastStep;
           // A distinct gesture may step as soon as the cadence has elapsed.
-          // Input that never stops arriving — a long momentum tail, or a wheel
-          // being spun continuously — is paced more slowly instead of chaining
+          // Input that never stops arriving, a long momentum tail or a wheel
+          // being spun continuously, is paced more slowly instead of chaining
           // one item straight into the next.
           if (since < CONFIG.cadence * 1000) return;
           if (!newGesture && since < CONFIG.cadence * CONFIG.sustained * 1000) return;
@@ -466,23 +488,39 @@
       }
     );
 
-
-        /* ---------------------- mobile / reduced motion: no pin, no capture */
+    /* ---------------------- mobile / reduced motion: no pin, no capture */
 
     mm.add(
       '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px), (prefers-reduced-motion: reduce)',
       function () {
-        // The section scrolls normally. The row nearest a fixed line on screen
-        // becomes the active one, so row height never decides whether a step
-        // fires. Short collapsed rows on a phone broke the old per-row ranges:
-        // 'bottom 30%' landed before 'top 70%' and the range collapsed.
-        // Touch scrolling is never intercepted here.
-        unlockPage();
+        // The section scrolls normally. The row whose centre sits nearest a
+        // fixed line on screen becomes the active one, so row height never
+        // decides whether a step fires. The old per-row ranges used
+        // 'top 70%' to 'bottom 30%', which needs a row taller than 40% of the
+        // viewport. Collapsed rows on a phone are shorter than that, the range
+        // inverts, and the callbacks stop firing. Touch scrolling is never
+        // intercepted here.
+        unlockPage();                 // in case we crossed the breakpoint locked
+
+        // Guard the config value. A missing or out-of-range number used to
+        // produce NaN distances, which silently pinned the result at item 1.
+        var lineFraction = CONFIG.mobileActiveLine;
+        if (typeof lineFraction !== 'number' || !isFinite(lineFraction)) lineFraction = 0.55;
+        lineFraction = Math.max(0, Math.min(1, lineFraction));
+
+        if (CONFIG.debug) {
+          var stickyPos = getComputedStyle(sticky).position;
+          if (stickyPos === 'sticky' || stickyPos === 'fixed') {
+            console.warn('[infra] .infra_sticky is still', stickyPos,
+              'at this breakpoint. Rows will not move relative to the viewport ' +
+              'and the dial will stay on item 1. Fix this in CSS, not here.');
+          }
+        }
 
         var current = -1;
 
         function nearestRow() {
-          var line = window.innerHeight * CONFIG.mobileActiveLine;
+          var line = window.innerHeight * lineFraction;
           var best = 0;
           var bestDist = Infinity;
           for (var i = 0; i < items.length; i++) {
@@ -495,11 +533,14 @@
 
         function sync(initial) {
           var next = nearestRow();
-          if (next === current) return;
+          if (next === current && !initial) return;
           current = next;
           commit(next, initial ? { instantPaint: true, force: true } : null);
         }
 
+        // One trigger for the whole section rather than one per row. It only
+        // needs to tell us that a scroll happened while the section is on
+        // screen; nearestRow() decides the rest from live geometry.
         var scan = own(ScrollTrigger.create({
           trigger   : section,
           start     : 'top bottom',
@@ -508,47 +549,23 @@
           onRefresh : function () { current = -1; sync(true); }
         }));
 
+        // Rows can change height after the first paint (fonts, images, an
+        // accordion opening). Re-measure on the next frame instead of trusting
+        // the layout that existed when this ran.
+        var raf = requestAnimationFrame(function () { sync(true); });
+
         sync(true);   // paint before the first scroll event arrives
 
         return function cleanup() {
+          cancelAnimationFrame(raf);
           scan.kill();
         };
       }
     );
 
-    
-    /* ---------------------- mobile / reduced motion: no pin, no capture */
-
-    // mm.add(
-    //   '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px), (prefers-reduced-motion: reduce)',
-    //   function () {
-    //     // The section scrolls normally and each row becomes the active one as
-    //     // it reaches the middle of the screen. Still one item at a time, but
-    //     // touch scrolling is never intercepted. Lenis runs with syncTouch:false
-    //     // site-wide, so touch is native and this branch is unchanged by it.
-    //     unlockPage();                 // in case we crossed the breakpoint locked
-
-    //     var triggers = rows.map(function (row, i) {
-    //       return own(ScrollTrigger.create({
-    //         trigger     : row,
-    //         start       : 'top 70%',
-    //         end         : 'bottom 30%',
-    //         onEnter     : function () { commit(i); },
-    //         onEnterBack : function () { commit(i); }
-    //       }));
-    //     });
-
-    //     commit(0, { instantPaint: true, force: true });   // draw segment 1 once
-
-    //     return function cleanup() {
-    //       triggers.forEach(function (t) { t.kill(); });
-    //     };
-    //   }
-    // );
-
     /* --------------------------------------------------------------- layout */
 
-    // A stale block placed *after* this one in the page runs later, so sweep
+    // A stale block placed after this one in the page runs later, so sweep
     // again once everything inline has executed.
     window.addEventListener('load', resync);
     if (document.fonts && document.fonts.ready) {

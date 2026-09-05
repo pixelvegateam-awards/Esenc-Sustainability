@@ -20,7 +20,7 @@
   var TICK_DOM = [1, 2, 3, 4, 0];
 
   var CONFIG = {
-    stepDuration : 0.75,  // ring travel for one step, seconds — both directions
+    stepDuration : 0.5,  // ring travel for one step, seconds — both directions
     stepEase     : 'power2.inOut',
 
     // ---- Pacing. These three numbers are the whole feel of the section ----

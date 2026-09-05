@@ -466,34 +466,85 @@
       }
     );
 
-    /* ---------------------- mobile / reduced motion: no pin, no capture */
+
+        /* ---------------------- mobile / reduced motion: no pin, no capture */
 
     mm.add(
       '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px), (prefers-reduced-motion: reduce)',
       function () {
-        // The section scrolls normally and each row becomes the active one as
-        // it reaches the middle of the screen. Still one item at a time, but
-        // touch scrolling is never intercepted. Lenis runs with syncTouch:false
-        // site-wide, so touch is native and this branch is unchanged by it.
-        unlockPage();                 // in case we crossed the breakpoint locked
+        // The section scrolls normally. The row nearest a fixed line on screen
+        // becomes the active one, so row height never decides whether a step
+        // fires. Short collapsed rows on a phone broke the old per-row ranges:
+        // 'bottom 30%' landed before 'top 70%' and the range collapsed.
+        // Touch scrolling is never intercepted here.
+        unlockPage();
 
-        var triggers = rows.map(function (row, i) {
-          return own(ScrollTrigger.create({
-            trigger     : row,
-            start       : 'top 70%',
-            end         : 'bottom 30%',
-            onEnter     : function () { commit(i); },
-            onEnterBack : function () { commit(i); }
-          }));
-        });
+        var current = -1;
 
-        commit(0, { instantPaint: true, force: true });   // draw segment 1 once
+        function nearestRow() {
+          var line = window.innerHeight * CONFIG.mobileActiveLine;
+          var best = 0;
+          var bestDist = Infinity;
+          for (var i = 0; i < items.length; i++) {
+            var box = items[i].el.getBoundingClientRect();
+            var dist = Math.abs(box.top + box.height / 2 - line);
+            if (dist < bestDist) { bestDist = dist; best = i; }
+          }
+          return best;
+        }
+
+        function sync(initial) {
+          var next = nearestRow();
+          if (next === current) return;
+          current = next;
+          commit(next, initial ? { instantPaint: true, force: true } : null);
+        }
+
+        var scan = own(ScrollTrigger.create({
+          trigger   : section,
+          start     : 'top bottom',
+          end       : 'bottom top',
+          onUpdate  : function () { sync(false); },
+          onRefresh : function () { current = -1; sync(true); }
+        }));
+
+        sync(true);   // paint before the first scroll event arrives
 
         return function cleanup() {
-          triggers.forEach(function (t) { t.kill(); });
+          scan.kill();
         };
       }
     );
+
+    
+    /* ---------------------- mobile / reduced motion: no pin, no capture */
+
+    // mm.add(
+    //   '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px), (prefers-reduced-motion: reduce)',
+    //   function () {
+    //     // The section scrolls normally and each row becomes the active one as
+    //     // it reaches the middle of the screen. Still one item at a time, but
+    //     // touch scrolling is never intercepted. Lenis runs with syncTouch:false
+    //     // site-wide, so touch is native and this branch is unchanged by it.
+    //     unlockPage();                 // in case we crossed the breakpoint locked
+
+    //     var triggers = rows.map(function (row, i) {
+    //       return own(ScrollTrigger.create({
+    //         trigger     : row,
+    //         start       : 'top 70%',
+    //         end         : 'bottom 30%',
+    //         onEnter     : function () { commit(i); },
+    //         onEnterBack : function () { commit(i); }
+    //       }));
+    //     });
+
+    //     commit(0, { instantPaint: true, force: true });   // draw segment 1 once
+
+    //     return function cleanup() {
+    //       triggers.forEach(function (t) { t.kill(); });
+    //     };
+    //   }
+    // );
 
     /* --------------------------------------------------------------- layout */
 

@@ -544,8 +544,8 @@
 
     var CFG = {
       ampX: 30, yRatio: 0.667, speed: 1.1,
-      stagger: 0.30, draw: 0.80, mark: 0.42, label: 0.45, lead: 0.12,
-      gap: 0, fallback: 2.0, bail: 9.0, start: 'top 75%'
+      stagger: 0.18, draw: 0.55, mark: 0.30, label: 0.35, lead: 0.06,
+      gap: -0.45, fallback: 2.0, bail: 9.0, start: 'top 75%'
     };
 
     var sum = 0, oi;

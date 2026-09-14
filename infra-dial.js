@@ -1,10 +1,3 @@
-<!-- ============================================================
-     01 // INFRASTRUCTURE — stepper
-     Desktop / tablet: GSAP pins the section and one gesture moves
-     one item. Phone: no pin at all — the section keeps its Webflow
-     height and scrolls normally, and the items are driven by tap.
-     ============================================================ -->
-<script>
 (function () {
   'use strict';
 
@@ -516,4 +509,3 @@
   if (document.readyState !== 'loading') init();
   else document.addEventListener('DOMContentLoaded', function () { init(); });
 })();
-</script>

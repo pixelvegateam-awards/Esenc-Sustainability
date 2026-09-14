@@ -1,58 +1,46 @@
-/*!
- * infra-dial: pinned "infrastructure" stepper for Webflow (GSAP + ScrollTrigger + Observer)
- * Desktop branch is unchanged from the battle-tested original. The mobile branch was rewritten:
- * the old per-row ranges depended on row height and collapsed on short phone rows.
- * Serve the minified build over the CDN.
- */
+<!-- ============================================================
+     01 // INFRASTRUCTURE — stepper
+     Desktop / tablet: GSAP pins the section and one gesture moves
+     one item. Phone: no pin at all — the section keeps its Webflow
+     height and scrolls normally, and the items are driven by tap.
+     ============================================================ -->
+<script>
 (function () {
   'use strict';
 
-  // Ring position of each tick, as a fraction of the circle. Index 0 is the
-  // tick at the top, which is both the start (0) and the end (1) of the ring.
-  var TICKS = [0, 0.2165, 0.4069, 0.6335, 0.8049];
+  /* ===== CONFIG ===== */
+  var CONFIG = {
+    stepDuration    : 0.7,            // ring travel for one step, seconds
+    stepEase        : 'power2.inOut',
 
-  // How far the ring is filled on each item: one segment per item, closing
-  // the circle on the last one. Result: [0.2165, 0.4069, 0.6335, 0.8049, 1]
-  var FILL = TICKS.slice(1).concat(1);
+    // -- pinned stepper (desktop + tablet) --
+    cadence         : 0.7,            // shortest gap between two items, seconds
+    sustained       : 1.15,           // cadence multiplier while input keeps arriving
+    gestureGap      : 0.09,           // quiet that marks a new gesture, seconds
+    entryLock       : 0.3,            // immunity right after the section takes input
+    tolerance       : 10,             // px of wheel before Observer reports a gesture
+    touchTolerance  : 24,             // px of finger travel before a swipe counts
+    pinScreens      : 1.2,            // page scroll the pin owns
 
-  // Which marker (in DOM order) each item's fill lands on. Item 5 lands back
-  // on the top marker, because that is where a full ring finishes.
+    // -- phone --
+    phoneAutoplay   : true,           // walk through the items once while on screen
+    phoneDwell      : 3.2,            // seconds an item stays open during that walk
+
+    captionFade     : 380,            // keep in sync with the CSS fade on .infra_dial-text
+    desktopFrom     : 768,            // where the pinned stepper takes over
+    debug           : false
+  };
+  /* ===== END CONFIG ===== */
+
+  // Ring geometry. TICKS = marker positions as a fraction of the circle (0 = top).
+  // FILL = how far the ring is filled after each item. TICK_DOM = which marker,
+  // in DOM order, each item's fill lands on (item 5 closes back onto the top one).
+  var TICKS    = [0, 0.2165, 0.4069, 0.6335, 0.8049];
+  var FILL     = TICKS.slice(1).concat(1);
   var TICK_DOM = [1, 2, 3, 4, 0];
 
-  /* ==================================================================
-     CONFIG BLOCK
-     Every adjustable value lives here. Nothing below this block needs
-     editing to change timing, pacing, breakpoints or feel.
-     ================================================================== */
-  var CONFIG = {
-    stepDuration : 0.5,   // ring travel for one step, in seconds, both directions
-    stepEase     : 'power2.inOut',
-
-    // ---- Pacing. These four numbers are the whole feel of the section ----
-    cadence      : 0.55,  // s, shortest possible gap between two items
-    sustained    : 1.15,  // multiplier on cadence while input never stops arriving
-    gestureGap   : 0.09,  // s of quiet that marks the start of a new gesture
-    entryLock    : 0.3,   // s of immunity right after the section takes the input
-
-    tolerance    : 10,    // px of input before Observer reports a gesture
-    captionFade  : 380,   // keep in sync with the CSS fade on .infra_dial-text
-    pinScreens   : 1.2,   // page scroll the pinned section owns
-
-    desktopFrom  : 768,   // below this width: no pin, no input capture
-
-    // ---- Mobile branch only ----
-    // Where the "active" line sits on screen, as a fraction of viewport height.
-    // 0 = very top, 1 = very bottom. The row whose centre is nearest this line
-    // becomes the current item. Lower the number to activate rows earlier.
-    mobileActiveLine : 0.55,
-
-    debug        : false  // true: log every ring move and every mobile sync
-  };
-  /* ================= END CONFIG BLOCK ================= */
-
   function init(tries) {
-    // Webflow's GSAP bundle normally loads above this file, but never assume.
-    if (!window.gsap || !window.ScrollTrigger) {
+    if (!window.gsap || !window.ScrollTrigger) {        // Webflow's bundle may still be loading
       if ((tries || 0) > 60) return;
       return void setTimeout(function () { init((tries || 0) + 1); }, 50);
     }
@@ -60,76 +48,43 @@
     var section = document.querySelector('.section_infrastructure');
     if (!section) return;
 
-    var find = function (sel) {
-      return Array.prototype.slice.call(section.querySelectorAll(sel));
-    };
+    var one = function (s) { return section.querySelector(s); };
+    var all = function (s) { return Array.prototype.slice.call(section.querySelectorAll(s)); };
 
-    var rows    = find('[data-infra-item]');
-    var markers = find('.infra_dial-svg g line');
-    var arc     = section.querySelector('.infra_dial-progress');
-    var counter = section.querySelector('.infra_dial-counter .counter_change');
-    var caption = section.querySelector('.infra_dial-text');
-    var track   = section.querySelector('.infra_track');
-    var sticky  = section.querySelector('.infra_sticky');
-
+    var rows    = all('[data-infra-item]');
+    var markers = all('.infra_dial-svg g line');
+    var arc     = one('.infra_dial-progress');
+    var counter = one('.infra_dial-counter .counter_change');
+    var caption = one('.infra_dial-text');
+    var track   = one('.infra_track');
+    var sticky  = one('.infra_sticky');
+    var dial    = one('.infra_dial');
     if (!arc || !rows.length || !track || !sticky) return;
 
-    // Cache per-row nodes and caption text once. The markup never changes
-    // after render, so this is identical behaviour with fewer DOM lookups.
+    if (window.__infraStepper) return;                  // a second copy of this script
+    window.__infraStepper = true;
+
+    // Cache per-row nodes and caption text once; the markup never changes.
     var items = rows.map(function (row) {
-      var source = row.querySelector('.infra_dial-source');
+      var src = row.querySelector('.infra_dial-source');
       return {
         el     : row,
         body   : row.querySelector('.infra_body-wrap'),
         number : row.querySelector('.infra_number'),
-        text   : source ? source.textContent.trim() : ''
+        text   : src ? src.textContent.trim() : ''
       };
     });
 
     gsap.registerPlugin(ScrollTrigger);
     if (window.Observer) gsap.registerPlugin(Observer);
 
-    // Mobile browsers fire resize when the address bar hides or shows. Without
-    // this, ScrollTrigger refreshes mid-scroll and positions shift under the
-    // reader. Harmless on desktop.
+    // Phones fire resize when the address bar slides; without this the pin
+    // re-measures mid-scroll and shifts under the reader.
     ScrollTrigger.config({ ignoreMobileResize: true });
 
-    /* --- Sole owner of this section -------------------------------------
-       Two implementations writing to the same dial is unfixable from inside
-       either one: an old scrub version caps the ring at 0.8049 (one segment
-       short) and keeps overwriting the arc from its own 7-screen pin. So
-       this script claims the section and retires anything else pinned to
-       it. Delete the old blocks from the custom code anyway. This is a
-       safety net, not a substitute.                                      */
-    if (window.__infraStepper) return;      // a second copy of this script
-    window.__infraStepper = true;
-
-    var OWNED = '__infraStepperST';
-
-    function sweepForeign() {
-      ScrollTrigger.getAll().forEach(function (st) {
-        if (st[OWNED]) return;              // one of ours
-        var t = st.trigger, p = st.pin;
-        if ((t && section.contains(t)) || (p && section.contains(p))) {
-          if (CONFIG.debug) console.warn('[infra] retiring a stale ScrollTrigger on this section');
-          if (st.animation) st.animation.kill();
-          st.kill(true);
-        }
-      });
-    }
-
-    function own(st) { st[OWNED] = true; return st; }
-
-    function resync() { sweepForeign(); ScrollTrigger.refresh(); }
-
-    sweepForeign();
-
-    /* --- Lenis bridge ----------------------------------------------------
-       Lenis itself is booted from Site Settings, Footer. Read it lazily,
-       every time: it may still be loading when this runs, and the section
-       must work either way. With Lenis present the page is locked outright
-       while the section holds the input, instead of relying on a
-       preventDefault that momentum scrolling is allowed to ignore.       */
+    // Lenis is booted from Site Settings - read it lazily, it may still be
+    // loading. With Lenis present the page is locked outright while the section
+    // holds the input, rather than relying on a preventDefault momentum ignores.
     function lenis()      { return window.lenis || null; }
     function lockPage()   { var l = lenis(); if (l) l.stop(); }
     function unlockPage() { var l = lenis(); if (l) l.start(); }
@@ -140,29 +95,23 @@
     }
 
     var steps      = rows.length;
-    var index      = -1;         // the committed item, the only source of truth
+    var index      = -1;        // the committed item, the only source of truth
     var animating  = false;
-    var retreating = false;      // the ring is retracting back to empty
+    var retreating = false;     // the ring is retracting back to empty
     var ring       = { value: 0 };
-    var ringTween;
-    var captionTimer;
-    var captionToken = 0;
+    var ringTween, captionTimer, captionToken = 0;
 
-    /* ---------------------------------------------------------------- paint */
+    /* ---------------------------------------------------------- paint ---- */
 
-    function drawRing() {
-      arc.style.strokeDashoffset = 100 * (1 - ring.value);
-    }
+    function drawRing() { arc.style.strokeDashoffset = 100 * (1 - ring.value); }
 
-    function paintTicks(i) {
-      markers.forEach(function (marker) {
-        marker.classList.remove('is-on', 'is-now');
-      });
-      for (var t = 0; t <= i; t++) {           // i === -1 means nothing lit
-        var marker = markers[TICK_DOM[t]];
-        if (!marker) continue;
-        marker.classList.add('is-on');
-        if (t === i) marker.classList.add('is-now');
+    function paintTicks(i) {                            // i === -1 lights nothing
+      markers.forEach(function (m) { m.classList.remove('is-on', 'is-now'); });
+      for (var t = 0; t <= i; t++) {
+        var m = markers[TICK_DOM[t]];
+        if (!m) continue;
+        m.classList.add('is-on');
+        if (t === i) m.classList.add('is-now');
       }
     }
 
@@ -170,27 +119,29 @@
       items.forEach(function (it, r) {
         it.el.classList.toggle('is-current', r === i);
         it.el.classList.toggle('is-past', r < i);
-        if (it.body) it.body.classList.toggle('is-open', r === i);
+        if (it.body)   it.body.classList.toggle('is-open', r === i);
         if (it.number) it.number.classList.toggle('is-active', r === i);
+        if (it.el.getAttribute('role') === 'button') {
+          it.el.setAttribute('aria-expanded', r === i ? 'true' : 'false');
+        }
       });
 
       if (counter) counter.textContent = ('0' + (i + 1)).slice(-2);
       if (!caption) return;
 
       var text = items[i].text;
+      clearTimeout(captionTimer);
 
       if (instant) {
-        clearTimeout(captionTimer);
         captionToken++;
         caption.classList.remove('is-out');
         caption.textContent = text;
         return;
       }
 
-      // Token guard: only the newest change may restore the caption, so it
-      // can never be left stuck in the is-out state.
+      // Token guard: only the newest change restores the caption, so it can
+      // never be left stuck in the is-out state.
       var token = ++captionToken;
-      clearTimeout(captionTimer);
       caption.classList.add('is-out');
       captionTimer = setTimeout(function () {
         if (token !== captionToken) return;
@@ -199,9 +150,8 @@
       }, CONFIG.captionFade);
     }
 
-    // Every ring move goes through here: same duration, same ease, forward or
-    // backward. It always starts from wherever the ring currently is, so a
-    // reversal mid-travel continues smoothly instead of snapping.
+    // Every ring move: same duration and ease both ways, always starting from
+    // wherever the ring is, so a mid-travel reversal continues smoothly.
     function moveRing(target, instant, onDone) {
       if (ringTween) ringTween.kill();
       retreating = false;
@@ -213,58 +163,45 @@
         duration   : duration,
         ease       : CONFIG.stepEase,
         onUpdate   : drawRing,
-        onComplete : function () {
-          animating = false;
-          if (onDone) onDone();
-        }
+        onComplete : function () { animating = false; if (onDone) onDone(); }
       });
     }
 
-    /* The single entry point for changing item. A step is atomic: rows, dial,
-       ticks and caption commit together, and `animating` stays true for the
-       whole travel so nothing can interrupt a step half-way through.
-
-       opts.instantPaint: swap rows and caption with no fade
-       opts.instantRing : jump the ring instead of travelling
-       opts.force       : re-commit even if the index is unchanged          */
+    // The only way to change item. Atomic: rows, ticks, caption and ring commit
+    // together and `animating` blocks input for the whole travel.
+    //   instantPaint - swap rows/caption with no fade
+    //   instantRing  - jump the ring instead of travelling
+    //   force        - re-commit even if the index is unchanged
     function commit(i, opts) {
       opts = opts || {};
       i = Math.max(0, Math.min(steps - 1, i));
-      if (i === index && !opts.force) return false;
+      if (i === index && !opts.force) return;
 
-      if (CONFIG.debug) console.log('[infra] item', index + 1, 'to', i + 1, 'fill', FILL[i]);
+      if (CONFIG.debug) console.log('[infra] item', index + 1, '->', i + 1, 'fill', FILL[i]);
 
       index = i;
       paintRows(i, !!opts.instantPaint);
       paintTicks(i);
       moveRing(FILL[i], !!opts.instantRing);
-      return true;
     }
 
-    // Leaving out of the top: retract segment 1 the same way it was drawn,
-    // rather than clearing it. The tick stays lit for the whole transit and
-    // goes dark once the ring is actually empty.
-    function retreat() {
-      if (retreating || (index === 0 && ring.value === 0)) {
-        paintTicks(-1);
-        return;
-      }
-      if (CONFIG.debug) console.log('[infra] retract from item', index + 1);
+    // Leaving out of the top: retract segment 1 the way it was drawn. The tick
+    // stays lit through the transit and goes dark once the ring is empty.
+    function retreat(instant) {
+      if (retreating || (index === 0 && ring.value === 0)) { paintTicks(-1); return; }
 
-      if (index !== 0) paintRows(0, false);   // eased, in case we left deeper in
+      if (index !== 0) paintRows(0, !!instant);
       index = 0;
-
-      moveRing(0, false, function () { paintTicks(-1); });
+      moveRing(0, !!instant, function () { paintTicks(-1); });
       retreating = true;                       // set after moveRing clears it
     }
 
-    // First paint only: item 1 open, ring empty, no tick lit. Segment 1 is
-    // NOT drawn here. The entry draws it, once.
+    // First paint: item 1 open, ring empty, no tick lit. Segment 1 is drawn by
+    // the entry (desktop) or the first auto step / tap (phone), not here.
     function prepare() {
       if (ringTween) ringTween.kill();
       index = 0;
-      animating = false;
-      retreating = false;
+      animating = retreating = false;
       ring.value = 0;
       drawRing();
       paintRows(0, true);
@@ -273,309 +210,310 @@
 
     prepare();
 
-    /* ------------------------------------------------- desktop: the stepper */
+    /* ============================ PHONE ==================================
+       No pin. The section keeps its Webflow height -- taller than a phone
+       screen -- and scrolls like any other section, so nothing is hidden,
+       nothing is resized and scrolling is never taken away from the reader.
+
+       The items are driven by tap, not by scroll: the five rows occupy only
+       ~335px, so a scroll-linked mapping would spend ~50px per item and a
+       single flick would run the whole set. While the dial is on screen the
+       section also walks itself through the items once, so a reader who
+       never taps still sees the ring draw; the first tap takes that over
+       for good.                                                           */
+
+    function phoneFlow() {
+      var still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var quick = still ? { instantPaint: true, instantRing: true } : null;
+      var manual = false, finished = false, timer = 0, io = null;
+      var bound = [];
+
+      unlockPage();            // never inherit a lock from the pinned branch
+
+      function stopAuto() { clearTimeout(timer); timer = 0; }
+
+      function tick() {
+        timer = 0;
+        if (manual || finished) return;
+        if (index >= steps - 1) { finished = true; return; }
+        commit(index + 1);
+        timer = setTimeout(tick, CONFIG.phoneDwell * 1000);
+      }
+
+      function startAuto() {
+        if (!CONFIG.phoneAutoplay || still || manual || finished || timer) return;
+        timer = setTimeout(tick, CONFIG.phoneDwell * 1000);
+      }
+
+      function select(i) {
+        manual = true;                     // the reader is driving from here on
+        stopAuto();
+        commit(i, quick);
+      }
+
+      items.forEach(function (it, i) {
+        it.el.style.cursor = 'pointer';
+        it.el.setAttribute('role', 'button');
+        it.el.setAttribute('tabindex', '0');
+        it.el.setAttribute('aria-expanded', i === index ? 'true' : 'false');
+
+        var onTap = function () { select(i); };
+        var onKey = function (e) {
+          if (e.key !== 'Enter' && e.key !== ' ') return;
+          e.preventDefault();
+          select(i);
+        };
+        it.el.addEventListener('click', onTap);
+        it.el.addEventListener('keydown', onKey);
+        bound.push([it.el, onTap, onKey]);
+      });
+
+      // Start the walk when the dial is actually worth watching, and pause it
+      // the moment the section leaves the screen.
+      if (window.IntersectionObserver && dial) {
+        io = new IntersectionObserver(function (entries) {
+          if (entries[0].isIntersecting) startAuto();
+          else stopAuto();
+        }, { threshold: 0.35 });
+        io.observe(dial);
+      } else {
+        startAuto();
+      }
+
+      return function cleanup() {
+        stopAuto();
+        if (io) io.disconnect();
+        bound.forEach(function (b) {
+          b[0].removeEventListener('click', b[1]);
+          b[0].removeEventListener('keydown', b[2]);
+          b[0].style.cursor = '';
+          b[0].removeAttribute('role');
+          b[0].removeAttribute('tabindex');
+          b[0].removeAttribute('aria-expanded');
+        });
+      };
+    }
+
+    /* ====================== DESKTOP + TABLET =============================
+       The pinned stepper, unchanged: one gesture moves exactly one item.  */
 
     var FRESH = 0, INSIDE = 1, DONE = 2;
 
-    var mm = gsap.matchMedia();
+    function stepper() {
+      var still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var quick = still ? { instantPaint: true, instantRing: true } : null;
 
-    mm.add(
-      '(min-width: ' + CONFIG.desktopFrom + 'px) and (prefers-reduced-motion: no-preference)',
-      function () {
-        var phase      = FRESH;
-        var engaged    = false;
-        var refreshing = false;  // suppress phase changes during a refresh
-        var lastInput  = 0;
-        var lastStep   = -1e9;
-        var newGesture = true;   // flipped back on by a quiet gap in the input
-        var reEngageAt = 0;      // do not re-grab scrolling right after a release
+      var phase      = FRESH;
+      var engaged    = false;
+      var refreshing = false;   // a refresh replays callbacks; not a real crossing
+      var lastInput  = 0;
+      var lastStep   = -1e9;
+      var newGesture = true;    // turned back on by a quiet gap in the input
+      var reEngageAt = 0;       // do not re-grab scrolling right after a release
 
-        function onRefreshInit() { refreshing = true; }
-        function onRefresh() { refreshing = false; }
-        ScrollTrigger.addEventListener('refreshInit', onRefreshInit);
-        ScrollTrigger.addEventListener('refresh', onRefresh);
+      function onRefreshInit() { refreshing = true; }
+      function onRefresh()     { refreshing = false; }
+      ScrollTrigger.addEventListener('refreshInit', onRefreshInit);
+      ScrollTrigger.addEventListener('refresh', onRefresh);
 
-        /* GSAP fires these callbacks synchronously from inside create() and
-           from _refreshAll(), i.e. before `pin` has been assigned. Reading
-           pin.progress there threw "Cannot read properties of undefined
-           (reading 'progress')" on load, which aborted the entry before it
-           could commit an item or capture input, leaving the dial to
-           whatever else was painting it. So every callback uses the instance
-           GSAP hands it and never relies on the variable.                 */
-        var pin;
-        function inst(self) { return self || pin; }
+      // GSAP fires the callbacks below from inside create(), before `pin` is
+      // assigned, so they use the instance handed to them via inst(). Same
+      // reason the observer is built first: engage() must find a real one.
+      // wheelSpeed:-1 -> onUp means the user is going down the page.
+      // preventDefault is what actually holds a touch tablet still.
+      var pin;
+      function inst(self) { return self || pin; }
 
-        // Built BEFORE the ScrollTrigger for the same reason: a callback can
-        // fire from inside create(), and engage() must find a real observer
-        // to enable, otherwise the section pins with the input uncaptured.
-        // wheelSpeed:-1 matches GSAP's own stepper demos: onUp means the
-        // user is going down the page. preventDefault is kept as a second
-        // line of defence. With Lenis running, lockPage() is the one that
-        // actually holds the page still.
-        var observer = window.Observer && Observer.create({
-          target         : window,
-          type           : 'wheel,touch',
-          wheelSpeed     : -1,
-          tolerance      : CONFIG.tolerance,
-          preventDefault : true,
-          onUp           : function () { step(1); },
-          onDown         : function () { step(-1); }
-        });
-        if (observer) observer.disable();
+      var observer = window.Observer && Observer.create({
+        target         : window,
+        type           : 'wheel,touch',
+        wheelSpeed     : -1,
+        tolerance      : CONFIG.tolerance,
+        dragMinimum    : CONFIG.touchTolerance,
+        preventDefault : true,
+        onUp           : function () { step(1); },
+        onDown         : function () { step(-1); }
+      });
+      if (observer) observer.disable();
 
-        pin = own(ScrollTrigger.create({
-          trigger : track,
-          start   : 'top top',
-          end     : function () {
-            return '+=' + Math.round(CONFIG.pinScreens * window.innerHeight);
-          },
-          pin                 : sticky,
-          pinSpacing          : true,
-          // anticipatePin removed: it exists to mask compositor scroll lag,
-          // which Lenis has already removed. Leaving it on pins a frame early.
-          invalidateOnRefresh : true,
-          onEnter     : function (self) { arrive(-1, self); },  // crossed start, from above
-          onEnterBack : function (self) { arrive(1, self); },   // crossed end, from below
-          onLeave     : function () { leave(1); },
-          onLeaveBack : function () { leave(-1); },
-          onUpdate    : function (self) {
-            // Safety net: if an onEnter was refused during the post-release
-            // window, take the input back on the next scroll update rather
-            // than letting the reader slide through the pinned range. A
-            // finished reader heading down is left alone.
-            if (engaged || !self.isActive) return;
-            if (performance.now() < reEngageAt) return;
-            if (phase === DONE && self.direction > 0) return;
-            engage(self);
-          }
-        }));
-
-        function onKey(e) {
-          if (!engaged || e.metaKey || e.ctrlKey || e.altKey) return;
-          var t = e.target;
-          if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-
-          var dir = 0;
-          if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') dir = 1;
-          else if (e.key === 'ArrowUp' || e.key === 'PageUp') dir = -1;
-          if (!dir) return;
-
-          e.preventDefault();
-          step(dir);
-        }
-        window.addEventListener('keydown', onKey);
-
-        // side: -1 arriving from above, +1 arriving from below. Only a real
-        // crossing may change the phase. During a refresh the callbacks are
-        // just replays of where we already are. `engaged` is what separates a
-        // replay from a real crossing: if we still hold the input we are
-        // mid-pass, so the phase is left alone.
-        function arrive(side, self) {
-          if (!refreshing && !engaged) {
-            if (side < 0) phase = FRESH;                     // over the top edge: new pass
-            else if (phase === FRESH) phase = DONE;          // came up from below
-          }
+      pin = ScrollTrigger.create({
+        trigger : track,
+        // Normally the section is exactly one screen tall here, so it pins at
+        // the top. If a short landscape tablet makes it taller, pinning at the
+        // top would hide its bottom for good, so the pin aligns to the bottom
+        // instead. Re-evaluated on every refresh.
+        start   : function () {
+          return sticky.offsetHeight > window.innerHeight ? 'bottom bottom' : 'top top';
+        },
+        end     : function () {
+          return '+=' + Math.round(CONFIG.pinScreens * window.innerHeight);
+        },
+        pin                 : sticky,
+        pinSpacing          : true,
+        invalidateOnRefresh : true,   // no anticipatePin: Lenis already removed the lag it masks
+        onEnter     : function (self) { arrive(-1, self); },   // crossed start, from above
+        onEnterBack : function (self) { arrive(1, self); },    // crossed end, from below
+        onLeave     : function () { leave(1); },
+        onLeaveBack : function () { leave(-1); },
+        onUpdate    : function (self) {
+          // If an onEnter was refused during the post-release window, take the
+          // input back on the next update instead of letting the reader slide
+          // through the pinned range. A finished reader going down is left alone.
+          if (engaged || !self.isActive) return;
+          if (performance.now() < reEngageAt) return;
+          if (phase === DONE && self.direction > 0) return;
           engage(self);
         }
+      });
 
-        function engage(self) {
-          if (engaged || performance.now() < reEngageAt) return;
+      function onKey(e) {
+        if (!engaged || e.metaKey || e.ctrlKey || e.altKey) return;
+        var t = e.target;
+        if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
 
-          var t = inst(self);
-          if (!t) return;               // nothing to measure against yet
+        var dir = 0;
+        if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') dir = 1;
+        else if (e.key === 'ArrowUp' || e.key === 'PageUp') dir = -1;
+        if (!dir) return;
 
-          // A very fast page scroll can land part-way into the pinned range
-          // before we take over. Reclaim it so stepping always starts from a
-          // clean position (invisible: the pinned view is identical anywhere
-          // inside the range). If the flick cleared the section entirely we
-          // let it go rather than yanking the reader backwards.
-          if (t.progress > 0.02 && t.progress < 0.98) {
-            jumpTo(t.start + 2);
-          }
-
-          engaged = true;
-          lockPage();                  // hard stop, Lenis stops feeding scroll
-
-          // The phase decides what a re-entry restores. Never the scroll
-          // direction, and never a replay of the entry animation.
-          if (phase === FRESH) {
-            commit(0, { instantPaint: true, force: true });         // draw segment 1
-          } else if (phase === DONE && index !== steps - 1) {
-            commit(steps - 1, { instantPaint: true, instantRing: true, force: true });
-          }
-          phase = INSIDE;
-
-          // The momentum tail that carried the reader in must not immediately
-          // advance an item. Backdating lastStep gives a short entryLock
-          // instead of a full cadence, so the first deliberate scroll after
-          // arriving is answered quickly rather than sitting dead for a second.
-          var t0 = performance.now();
-          lastInput = t0;
-          lastStep = t0 - Math.max(0, (CONFIG.cadence - CONFIG.entryLock) * 1000);
-          newGesture = false;
-
-          if (observer) observer.enable();
-        }
-
-        function disengage() {
-          if (!engaged) return;
-          engaged = false;
-          unlockPage();                // give scrolling back before anything moves
-          if (observer) observer.disable();
-        }
-
-        function leave(dir) {
-          disengage();
-          if (refreshing) return;   // a refresh is not a real exit
-          if (dir < 0) {
-            retreat();              // out of the top: retract the ring to empty
-            phase = FRESH;
-          } else {
-            phase = DONE;           // out of the bottom: keep item 5, ring closed
-          }
-        }
-
-        // Past the last (or before the first) item: give scrolling back to the
-        // page and jump to the pin edge, so no dead pinned stretch is left to
-        // scroll through.
-        function release(dir) {
-          disengage();
-          phase = dir > 0 ? DONE : FRESH;
-          reEngageAt = performance.now() + 450;
-          var t = inst();
-          if (!t) return;
-          jumpTo(Math.max(0, dir > 0 ? t.end + 2 : t.start - 2));
-        }
-
-        function step(dir) {
-          var now = performance.now();
-          var quiet = (now - lastInput) > CONFIG.gestureGap * 1000;
-          lastInput = now;                 // every event counts, committed or not
-          if (quiet) newGesture = true;
-
-          if (!engaged || animating) return;
-
-          var since = now - lastStep;
-          // A distinct gesture may step as soon as the cadence has elapsed.
-          // Input that never stops arriving, a long momentum tail or a wheel
-          // being spun continuously, is paced more slowly instead of chaining
-          // one item straight into the next.
-          if (since < CONFIG.cadence * 1000) return;
-          if (!newGesture && since < CONFIG.cadence * CONFIG.sustained * 1000) return;
-
-          var next = index + dir;
-          if (next < 0 || next > steps - 1) { release(dir); return; }
-
-          newGesture = false;
-          lastStep = now;
-          commit(next);
-        }
-
-        if (pin && pin.isActive) engage(pin);
-        // If a callback engaged us from inside create(), make sure the input
-        // really is captured now.
-        if (engaged && observer && !observer.isEnabled) observer.enable();
-
-        return function cleanup() {
-          disengage();
-          unlockPage();               // never leave the page locked behind us
-          ScrollTrigger.removeEventListener('refreshInit', onRefreshInit);
-          ScrollTrigger.removeEventListener('refresh', onRefresh);
-          window.removeEventListener('keydown', onKey);
-          if (observer) observer.kill();
-          if (pin) pin.kill(true);
-        };
+        e.preventDefault();
+        step(dir);
       }
-    );
+      window.addEventListener('keydown', onKey);
 
-    /* ---------------------- mobile / reduced motion: no pin, no capture */
-
-    mm.add(
-      '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px), (prefers-reduced-motion: reduce)',
-      function () {
-        // The section scrolls normally. The row whose centre sits nearest a
-        // fixed line on screen becomes the active one, so row height never
-        // decides whether a step fires. The old per-row ranges used
-        // 'top 70%' to 'bottom 30%', which needs a row taller than 40% of the
-        // viewport. Collapsed rows on a phone are shorter than that, the range
-        // inverts, and the callbacks stop firing. Touch scrolling is never
-        // intercepted here.
-        unlockPage();                 // in case we crossed the breakpoint locked
-
-        // Guard the config value. A missing or out-of-range number used to
-        // produce NaN distances, which silently pinned the result at item 1.
-        var lineFraction = CONFIG.mobileActiveLine;
-        if (typeof lineFraction !== 'number' || !isFinite(lineFraction)) lineFraction = 0.55;
-        lineFraction = Math.max(0, Math.min(1, lineFraction));
-
-        if (CONFIG.debug) {
-          var stickyPos = getComputedStyle(sticky).position;
-          if (stickyPos === 'sticky' || stickyPos === 'fixed') {
-            console.warn('[infra] .infra_sticky is still', stickyPos,
-              'at this breakpoint. Rows will not move relative to the viewport ' +
-              'and the dial will stay on item 1. Fix this in CSS, not here.');
-          }
+      // side: -1 arriving from above, +1 from below. Only a real crossing may
+      // change the phase; `engaged` separates a crossing from a refresh replay.
+      function arrive(side, self) {
+        if (!refreshing && !engaged) {
+          if (side < 0) phase = FRESH;               // over the top edge: new pass
+          else if (phase === FRESH) phase = DONE;    // came up from below
         }
-
-        var current = -1;
-
-        function nearestRow() {
-          var line = window.innerHeight * lineFraction;
-          var best = 0;
-          var bestDist = Infinity;
-          for (var i = 0; i < items.length; i++) {
-            var box = items[i].el.getBoundingClientRect();
-            var dist = Math.abs(box.top + box.height / 2 - line);
-            if (dist < bestDist) { bestDist = dist; best = i; }
-          }
-          return best;
-        }
-
-        function sync(initial) {
-          var next = nearestRow();
-          if (next === current && !initial) return;
-          current = next;
-          commit(next, initial ? { instantPaint: true, force: true } : null);
-        }
-
-        // One trigger for the whole section rather than one per row. It only
-        // needs to tell us that a scroll happened while the section is on
-        // screen; nearestRow() decides the rest from live geometry.
-        var scan = own(ScrollTrigger.create({
-          trigger   : section,
-          start     : 'top bottom',
-          end       : 'bottom top',
-          onUpdate  : function () { sync(false); },
-          onRefresh : function () { current = -1; sync(true); }
-        }));
-
-        // Rows can change height after the first paint (fonts, images, an
-        // accordion opening). Re-measure on the next frame instead of trusting
-        // the layout that existed when this ran.
-        var raf = requestAnimationFrame(function () { sync(true); });
-
-        sync(true);   // paint before the first scroll event arrives
-
-        return function cleanup() {
-          cancelAnimationFrame(raf);
-          scan.kill();
-        };
+        engage(self);
       }
-    );
 
-    /* --------------------------------------------------------------- layout */
+      function engage(self) {
+        if (engaged || performance.now() < reEngageAt) return;
 
-    // A stale block placed after this one in the page runs later, so sweep
-    // again once everything inline has executed.
-    window.addEventListener('load', resync);
-    if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(resync);
+        var t = inst(self);
+        if (!t) return;
+
+        // A fast page scroll can land part-way into the pinned range before we
+        // take over; reclaim it so stepping starts from a clean position. It is
+        // invisible - the pinned view is identical anywhere in the range.
+        if (t.progress > 0.02 && t.progress < 0.98) jumpTo(t.start + 2);
+
+        engaged = true;
+        lockPage();
+
+        // The phase, never the scroll direction, decides what a re-entry
+        // restores - and it never replays the entry animation.
+        if (phase === FRESH) {
+          commit(0, { instantPaint: true, instantRing: !!still, force: true });
+        } else if (phase === DONE && index !== steps - 1) {
+          commit(steps - 1, { instantPaint: true, instantRing: true, force: true });
+        }
+        phase = INSIDE;
+
+        // The momentum tail that carried the reader in must not advance an item.
+        // Backdating lastStep leaves a short entryLock instead of a full cadence,
+        // so the first deliberate scroll is answered quickly.
+        var t0 = performance.now();
+        lastInput  = t0;
+        lastStep   = t0 - Math.max(0, (CONFIG.cadence - CONFIG.entryLock) * 1000);
+        newGesture = false;
+
+        if (observer) observer.enable();
+      }
+
+      function disengage() {
+        if (!engaged) return;
+        engaged = false;
+        unlockPage();                      // hand scrolling back before anything moves
+        if (observer) observer.disable();
+      }
+
+      function leave(dir) {
+        disengage();
+        if (refreshing) return;            // a refresh is not a real exit
+        if (dir < 0) { retreat(still); phase = FRESH; }   // out of the top: empty the ring
+        else         { phase = DONE; }                    // out of the bottom: keep item 5
+      }
+
+      // Past the last (or before the first) item: hand scrolling back and jump
+      // to the pin edge, so no dead pinned stretch is left to scroll through.
+      function release(dir) {
+        disengage();
+        phase = dir > 0 ? DONE : FRESH;
+        reEngageAt = performance.now() + 450;
+        var t = inst();
+        if (!t) return;
+        jumpTo(Math.max(0, dir > 0 ? t.end + 2 : t.start - 2));
+      }
+
+      function step(dir) {
+        var now = performance.now();
+        var quiet = (now - lastInput) > CONFIG.gestureGap * 1000;
+        lastInput = now;                   // every event counts, committed or not
+        if (quiet) newGesture = true;
+
+        if (!engaged || animating) return;
+
+        // A distinct gesture steps as soon as the cadence has elapsed. Input
+        // that never stops - a momentum tail, a spinning wheel, a hard flick -
+        // is paced more slowly instead of chaining items together.
+        var since = now - lastStep;
+        if (since < CONFIG.cadence * 1000) return;
+        if (!newGesture && since < CONFIG.cadence * CONFIG.sustained * 1000) return;
+
+        var next = index + dir;
+        if (next < 0 || next > steps - 1) { release(dir); return; }
+
+        newGesture = false;
+        lastStep = now;
+        commit(next, quick);
+      }
+
+      if (pin && pin.isActive) engage(pin);
+      if (engaged && observer && !observer.isEnabled) observer.enable();
+
+      return function cleanup() {
+        disengage();
+        unlockPage();
+        ScrollTrigger.removeEventListener('refreshInit', onRefreshInit);
+        ScrollTrigger.removeEventListener('refresh', onRefresh);
+        window.removeEventListener('keydown', onKey);
+        if (observer) observer.kill();
+        if (pin) pin.kill(true);
+      };
     }
+
+    var mm    = gsap.matchMedia();
+    var DESK  = '(min-width: ' + CONFIG.desktopFrom + 'px)';
+    var PHONE = '(max-width: ' + (CONFIG.desktopFrom - 1) + 'px)';
+
+    mm.add(DESK + ' and (prefers-reduced-motion: no-preference)', stepper);
+
+    // Desktop + Reduce Motion: the Page Head CSS already opens every row and
+    // fills the ring, so just commit the last item to keep counter and ticks
+    // in step with what is on screen.
+    mm.add(DESK + ' and (prefers-reduced-motion: reduce)', function () {
+      unlockPage();
+      commit(steps - 1, { instantPaint: true, instantRing: true, force: true });
+    });
+
+    // Phone: one branch for every phone. Reduce Motion is honoured inside it
+    // (no autoplay, no easing), not by a separate static branch -- no phone
+    // CSS opens the rows, so a static branch would show one item and nothing
+    // else.
+    mm.add(PHONE, phoneFlow);
+
+    // Positions are measured before webfonts land; re-measure once they do.
+    function remeasure() { ScrollTrigger.refresh(); }
+    window.addEventListener('load', remeasure);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(remeasure);
   }
 
-  if (document.readyState !== 'loading') {
-    init();
-  } else {
-    document.addEventListener('DOMContentLoaded', function () { init(); });
-  }
+  if (document.readyState !== 'loading') init();
+  else document.addEventListener('DOMContentLoaded', function () { init(); });
 })();
+</script>
